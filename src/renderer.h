@@ -1,15 +1,16 @@
 #pragma once
 
-// renderer.h — Physarum Engine
+// renderer.h — Physarum Engine (Week 3: pheromone trail support)
 // Single-header OpenGL renderer: fullscreen quad + grayscale pixel texture
 // Requires: OpenGL 3.3 Core, GLAD, GLFW 3.4
 // Usage: include this file in exactly ONE translation unit to get the implementation.
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
-#include <cstring>   // memset
-#include <cstdio>    // fprintf
-#include <cstdlib>   // exit
+#include <cstring>    // memset
+#include <cstdio>     // fprintf
+#include <cstdlib>    // exit
+#include <algorithm>  // std::clamp
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -23,11 +24,14 @@ static constexpr int RENDERER_PIXELS = RENDERER_WIDTH * RENDERER_HEIGHT;
 // Internal state  (all static — lives in the TU that includes this header)
 // ---------------------------------------------------------------------------
 
-static float       g_pixels[RENDERER_PIXELS]; // CPU pixel buffer
-static GLuint      g_texture  = 0;
-static GLuint      g_shader   = 0;
-static GLuint      g_vao      = 0;
-static GLuint      g_vbo      = 0;
+static float  g_pixels  [RENDERER_PIXELS];  // CPU pixel buffer   — cleared every frame
+static float  g_trailMap[RENDERER_PIXELS];  // pheromone buffer   — persists between frames
+static float  g_trailTmp[RENDERER_PIXELS];  // scratch buffer used during diffusion
+
+static GLuint g_texture = 0;
+static GLuint g_shader  = 0;
+static GLuint g_vao     = 0;
+static GLuint g_vbo     = 0;
 
 // ---------------------------------------------------------------------------
 // Shader sources
@@ -103,15 +107,18 @@ static GLuint linkProgram(GLuint vert, GLuint frag)
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API — existing functions (unchanged behaviour)
 // ---------------------------------------------------------------------------
 
-/// Sets up the texture, shaders, and fullscreen quad VAO/VBO.
-/// Call once after creating the OpenGL context.
+/// Sets up the texture, shaders, fullscreen quad VAO/VBO, and zeroes both
+/// the pixel buffer and the trail map.  Call once after creating the OpenGL
+/// context.
 inline void initRenderer()
 {
-    // --- pixel buffer ---
-    memset(g_pixels, 0, sizeof(g_pixels));
+    // --- buffers ---
+    memset(g_pixels,   0, sizeof(g_pixels));
+    memset(g_trailMap, 0, sizeof(g_trailMap));
+    memset(g_trailTmp, 0, sizeof(g_trailTmp));
 
     // --- texture ---
     glGenTextures(1, &g_texture);
@@ -122,14 +129,13 @@ inline void initRenderer()
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-    // Allocate GPU storage (1-channel float texture)
     glTexImage2D(GL_TEXTURE_2D,
-                 0,                  // mip level
-                 GL_R32F,            // internal format: single-channel 32-bit float
+                 0,
+                 GL_R32F,
                  RENDERER_WIDTH,
                  RENDERER_HEIGHT,
                  0,
-                 GL_RED,             // pixel data format
+                 GL_RED,
                  GL_FLOAT,
                  g_pixels);
 
@@ -142,17 +148,13 @@ inline void initRenderer()
     glDeleteShader(vert);
     glDeleteShader(frag);
 
-    // Bind the texture sampler uniform once (it never changes)
     glUseProgram(g_shader);
-    glUniform1i(glGetUniformLocation(g_shader, "uTexture"), 0); // texture unit 0
+    glUniform1i(glGetUniformLocation(g_shader, "uTexture"), 0);
     glUseProgram(0);
 
     // --- fullscreen quad ---
-    // Two triangles covering NDC [-1,1] x [-1,1].
-    // Texture coords are flipped on Y so (0,0) maps to top-left of the pixel
-    // buffer (row 0 = top of screen).
-    //
-    //  aPos (x,y)     aTexCoord (u,v)
+    // Two triangles covering NDC [-1,1]x[-1,1].
+    // UV Y-flipped so row 0 of the buffer = top of screen.
     static const float QUAD[] = {
         // triangle 1
         -1.0f,  1.0f,   0.0f, 0.0f,   // top-left
@@ -165,18 +167,16 @@ inline void initRenderer()
     };
 
     glGenVertexArrays(1, &g_vao);
-    glGenBuffers(1, &g_vbo);
+    glGenBuffers(1,      &g_vbo);
 
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
 
-    // layout(location = 0): position (vec2)
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
                           4 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(0);
 
-    // layout(location = 1): texcoord (vec2)
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
                           4 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
@@ -185,16 +185,15 @@ inline void initRenderer()
     glBindVertexArray(0);
 }
 
-/// Sets all pixels in the CPU buffer to 0 (black).
-/// Call at the start of each frame before placing agents.
+/// Clears the pixel display buffer to 0 (black).
+/// NOTE: does NOT touch the trail map — trails persist between frames.
 inline void clearPixels()
 {
     memset(g_pixels, 0, sizeof(g_pixels));
 }
 
-/// Sets the pixel at (x, y) to 1.0 (white).
-/// Origin is top-left; x in [0, WIDTH-1], y in [0, HEIGHT-1].
-/// Out-of-bounds writes are silently ignored.
+/// Sets the pixel at (x, y) to 1.0 (white) in the display buffer.
+/// Origin is top-left; out-of-bounds writes are silently ignored.
 inline void setPixel(int x, int y)
 {
     if (x < 0 || x >= RENDERER_WIDTH ||
@@ -204,22 +203,20 @@ inline void setPixel(int x, int y)
     g_pixels[y * RENDERER_WIDTH + x] = 1.0f;
 }
 
-/// Uploads the CPU pixel buffer to the GPU texture and draws the fullscreen quad.
-/// Call once per frame after all setPixel() calls.
+/// Uploads the pixel buffer to the GPU and draws the fullscreen quad.
+/// Call once per frame after all setPixel() / trailToPixels() calls.
 inline void renderPixels()
 {
-    // Upload updated pixel data to GPU
     glBindTexture(GL_TEXTURE_2D, g_texture);
     glTexSubImage2D(GL_TEXTURE_2D,
-                    0,                  // mip level
-                    0, 0,               // x, y offset
+                    0,
+                    0, 0,
                     RENDERER_WIDTH,
                     RENDERER_HEIGHT,
                     GL_RED,
                     GL_FLOAT,
                     g_pixels);
 
-    // Draw
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(g_shader);
@@ -234,8 +231,7 @@ inline void renderPixels()
     glUseProgram(0);
 }
 
-/// Releases all OpenGL resources allocated by initRenderer().
-/// Call before destroying the OpenGL context.
+/// Releases all OpenGL resources.  Call before destroying the OpenGL context.
 inline void cleanupRenderer()
 {
     glDeleteVertexArrays(1, &g_vao);
@@ -247,4 +243,95 @@ inline void cleanupRenderer()
     g_vbo     = 0;
     g_texture = 0;
     g_shader  = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Public API — Week 3: pheromone trail functions
+// ---------------------------------------------------------------------------
+
+/// Adds `amount` of pheromone to the trail map at (x, y).
+/// Value is clamped to [0, 1] so trails never blow up.
+/// Out-of-bounds writes are silently ignored.
+inline void depositTrail(int x, int y, float amount)
+{
+    if (x < 0 || x >= RENDERER_WIDTH ||
+        y < 0 || y >= RENDERER_HEIGHT)
+        return;
+
+    float& cell = g_trailMap[y * RENDERER_WIDTH + x];
+    cell = std::clamp(cell + amount, 0.0f, 1.0f);
+}
+
+/// Returns the pheromone value at (x, y) in the trail map.
+/// Returns 0.0 for any out-of-bounds position.
+inline float senseTrail(int x, int y)
+{
+    if (x < 0 || x >= RENDERER_WIDTH ||
+        y < 0 || y >= RENDERER_HEIGHT)
+        return 0.0f;
+
+    return g_trailMap[y * RENDERER_WIDTH + x];
+}
+
+/// Decays and diffuses the trail map.  Call once per frame.
+///
+/// Two-pass operation:
+///   1. Diffuse  — each cell becomes a weighted blend of itself (60%) and the
+///                 average of its 8 neighbours (40%).  This spreads trails
+///                 outward by one pixel per frame, creating soft halos.
+///   2. Decay    — multiply every cell by (1 - decayRate).
+///                 decayRate = 0.01 → very slow fade (long-lived trails)
+///                 decayRate = 0.10 → fast fade (short-lived trails)
+///
+/// Border cells use only the neighbours that exist (no wrap-around).
+inline void decayAndDiffuseTrails(float decayRate)
+{
+    // --- pass 1: diffuse into g_trailTmp ---
+    for (int y = 0; y < RENDERER_HEIGHT; ++y)
+    {
+        for (int x = 0; x < RENDERER_WIDTH; ++x)
+        {
+            float sum    = 0.0f;
+            int   count  = 0;
+
+            // accumulate the 8 neighbours
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                    if (dx == 0 && dy == 0) continue; // skip self
+
+                    int nx = x + dx;
+                    int ny = y + dy;
+
+                    if (nx < 0 || nx >= RENDERER_WIDTH  ||
+                        ny < 0 || ny >= RENDERER_HEIGHT)
+                        continue;
+
+                    sum += g_trailMap[ny * RENDERER_WIDTH + nx];
+                    ++count;
+                }
+            }
+
+            float self      = g_trailMap[y * RENDERER_WIDTH + x];
+            float neighbourAvg = (count > 0) ? (sum / count) : self;
+
+            // 60% self, 40% neighbour average
+            g_trailTmp[y * RENDERER_WIDTH + x] = self * 0.6f + neighbourAvg * 0.4f;
+        }
+    }
+
+    // --- pass 2: decay and write back into g_trailMap ---
+    float keepRate = 1.0f - decayRate;
+    for (int i = 0; i < RENDERER_PIXELS; ++i)
+        g_trailMap[i] = g_trailTmp[i] * keepRate;
+}
+
+/// Copies the trail map into the display pixel buffer so it gets rendered.
+/// Call this instead of (or after) clearPixels() + setPixel() when you want
+/// trails to be visible.  Agent pixels can still be drawn on top with
+/// setPixel() after calling trailToPixels().
+inline void trailToPixels()
+{
+    memcpy(g_pixels, g_trailMap, sizeof(g_pixels));
 }

@@ -2,11 +2,10 @@
 #include <GLFW/glfw3.h>
 #include <iostream>
 
-#include "agents.h"
 #include "renderer.h"
+#include "agents.h"
 
 int main() {
-    // init GLFW
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -25,22 +24,26 @@ int main() {
     glfwMakeContextCurrent(window);
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
 
-    // init simulation
     initRenderer();
     initAgents();
 
-    // render loop
     while (!glfwWindowShouldClose(window)) {
-        clearPixels();
+        // decay and diffuse trails each frame
+        decayAndDiffuseTrails(0.02f);
 
+        // agents sense, turn, move, deposit
         updateAgents();
+        for (int i = 0; i < NUM_AGENTS; i++) {
+            depositTrail((int)agents[i].x, (int)agents[i].y, 1.0f);
+        }
 
+        // render trails with agent pixels on top
+        trailToPixels();
         for (int i = 0; i < NUM_AGENTS; i++) {
             setPixel((int)agents[i].x, (int)agents[i].y);
         }
 
         renderPixels();
-
         glfwSwapBuffers(window);
         glfwPollEvents();
     }

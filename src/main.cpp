@@ -2,13 +2,21 @@
 #include <GLFW/glfw3.h>
 #include <iostream>
 
+#include "agents.h"
+#include "renderer.h"
+
 int main() {
+    // init GLFW
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Physarum Engine", NULL, NULL);
+#ifdef __APPLE__
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#endif
+
+    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "Physarum Engine", NULL, NULL);
     if (!window) {
         std::cout << "Failed to create window" << std::endl;
         return -1;
@@ -17,13 +25,27 @@ int main() {
     glfwMakeContextCurrent(window);
     gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
 
+    // init simulation
+    initRenderer();
+    initAgents();
+
+    // render loop
     while (!glfwWindowShouldClose(window)) {
-        glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        clearPixels();
+
+        updateAgents();
+
+        for (int i = 0; i < NUM_AGENTS; i++) {
+            setPixel((int)agents[i].x, (int)agents[i].y);
+        }
+
+        renderPixels();
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
+    cleanupRenderer();
     glfwTerminate();
     return 0;
 }
